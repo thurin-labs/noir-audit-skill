@@ -2,6 +2,19 @@
 
 Use this checklist during manual review. For each item, actively search for vulnerabilities.
 
+## 0. Unconstrained / Unsafe / Oracles (highest priority)
+
+Values produced outside the constraint system are **prover-controlled** until re-checked
+in-circuit. This is the #1 Noir soundness bug class.
+
+- [ ] Every `unconstrained fn` result consumed through an `unsafe { ... }` block is re-constrained
+- [ ] Each `unsafe` block has a `Safety:` comment and matching asserts that pin the returned witness
+- [ ] Oracle / foreign-call (`#[oracle]`) outputs are validated, never trusted directly
+- [ ] Hint-then-verify is complete (e.g. division: `assert(q * d + r == n); assert(r < d)`)
+
+**Test**: `grep -rn "unconstrained\|unsafe\|#\[oracle\]"` and, for each, confirm a malicious
+prover cannot freely choose the result.
+
 ## 1. Constraint Completeness
 
 ### 1.1 Input Validation
@@ -13,8 +26,9 @@ Use this checklist during manual review. For each item, actively search for vuln
 ### 1.2 Business Logic Constraints
 - [ ] Every business rule has a corresponding `assert()` or constraint
 - [ ] Conditional logic (`if/else`) properly constrains all branches
-- [ ] Loop iterations are bounded and deterministic
+- [ ] Loop bounds are compile-time constants; watch for generics instantiated too small and `break` inside unconstrained code
 - [ ] Return values are constrained, not just computed
+- [ ] Any `Field` used as a 0/1 selector is constrained boolean (`assert(b * (b - 1) == 0)`) or uses the `bool` type
 
 ### 1.3 Underconstraint Detection
 - [ ] Can any private input be changed without invalidating the proof?
@@ -24,26 +38,29 @@ Use this checklist during manual review. For each item, actively search for vuln
 
 **Test**: For each private input, ask "What happens if I change this value?"
 
-## 2. Field Arithmetic Safety
+## 2. Arithmetic Safety
 
-### 2.1 Overflow/Underflow
-- [ ] Addition operations checked for field overflow
-- [ ] Subtraction operations checked for underflow (wrap-around)
-- [ ] Multiplication checked for overflow
-- [ ] Division by zero prevented
+Know the difference: **`Field` arithmetic wraps silently mod p** (the soundness risk).
+**Unsigned integer types (`u8`…`u128`) are compiler-range-checked** — overflow makes the proof
+*fail* (a completeness / DoS concern), it does not silently wrap. Don't flag ordinary `uN`
+arithmetic as "missing an overflow check."
 
-### 2.2 Range Checks
-- [ ] Integer values have explicit bounds: `assert(x.lt(256))`
-- [ ] Timestamps are within reasonable ranges
-- [ ] Amounts/balances are non-negative where required
-- [ ] Indices are within array bounds
+### 2.1 Field arithmetic (silent wrap)
+- [ ] `Field` add/sub/mul on attacker-controlled witnesses is preceded by explicit range or bit-size checks
+- [ ] No reliance on a `Field` "not overflowing" — the prover chooses the witness
+- [ ] Division / inverse guards against zero
 
-### 2.3 Field Element Assumptions
-- [ ] Code doesn't assume values fit in u64/u128 without checks
-- [ ] Comparison operations account for field wrapping
-- [ ] Bit operations use appropriate integer types
+### 2.2 Range checks (use the real API)
+- [ ] Bound a `Field` before trusting its size: `x.assert_max_bit_size::<8>()`, or cast to a
+      sized integer type. (`Field` has **no** `<` / `.lt()` — comparisons exist only on integer types.)
+- [ ] Timestamps, amounts, and indices are bounded to their expected ranges
+- [ ] `Field as uN` casts are preceded by a bit-size assertion (a bare cast truncates, it doesn't prove fit)
 
-**Test**: Try values near field modulus, zero, and max expected values.
+### 2.3 Encoding & canonicity
+- [ ] Bit/byte decompositions are constrained canonical (below the modulus — no x vs x+p aliasing)
+- [ ] Packed encodings are injective (no two witnesses map to the same packed value)
+
+**Test**: Try values near the field modulus, zero, and max expected values.
 
 ## 3. Privacy Analysis
 
@@ -81,9 +98,11 @@ Use this checklist during manual review. For each item, actively search for vuln
 - [ ] Multiple nullifiers from same user are unlinkable (if required)
 - [ ] Nullifier scheme is documented and matches implementation
 
-**Common pattern**:
+**Common pattern** (illustrative — the real call is
+`std::hash::poseidon2::Poseidon2::hash(inputs, N)`, and Poseidon/Poseidon2 have moved to an
+external library in recent Noir releases; confirm against the project's version):
 ```noir
-let nullifier = poseidon2([user_secret, event_id, context]);
+let nullifier = std::hash::poseidon2::Poseidon2::hash([user_secret, event_id, context], 3);
 ```
 
 ## 5. Cryptographic Primitive Usage
@@ -148,13 +167,15 @@ let nullifier = poseidon2([user_secret, event_id, context]);
 
 | Vulnerability | Check | Impact |
 |--------------|-------|--------|
+| Unconstrained/`unsafe` result | Is the returned witness re-checked with asserts? | Soundness break (prover controls it) |
 | Missing `assert()` | Can invalid input pass? | Soundness break |
-| Field overflow | `a + b` where both are large | Incorrect arithmetic |
-| Missing range check | Is `x < 256` enforced? | Type confusion |
+| Field overflow | `Field` add/mul on attacker-controlled values, no range check? | Silent wrap mod p → soundness |
+| Truncating cast | `x as u8` without `x.assert_max_bit_size::<8>()` first? | Aliasing / type confusion |
 | Public leak | Is `pub` intentional? | Privacy break |
 | Weak nullifier | Hash of small domain? | Brute-forceable |
 | No domain separation | Same hash for different uses? | Collision attacks |
 | Unbound proof | Proof works for any address? | Authorization bypass |
+| Verifier input gap | Does the consumer validate every public input? | Exploitable despite a sound circuit |
 
 ## Audit Completion Checklist
 

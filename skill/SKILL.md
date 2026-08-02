@@ -47,10 +47,15 @@ Execute these commands in order:
 
 ### 2.1 Compilation Check
 ```bash
-nargo check
+nargo compile   # compiles to ACIR and surfaces warnings (`nargo check` only type-checks + scaffolds Prover.toml)
+nargo info      # ACIR opcode / gate counts — a suspiciously low count is itself an underconstraint smell
 ```
 - Ensure clean compilation
 - Note any warnings (these often indicate issues)
+
+> **Caution — you are executing an untrusted repo.** Review `Nargo.toml` dependencies
+> and any oracle / foreign-call resolvers before running `nargo test`/`execute`: tests
+> can invoke oracles and git dependencies are pulled at check time.
 
 ### 2.2 Test Suite Execution
 ```bash
@@ -63,12 +68,15 @@ nargo test
 
 ### 2.3 Proof Generation (if test inputs available)
 ```bash
-nargo execute
-bb prove -b target/<circuit>.json -w target/<circuit>.gz -o target/proof -t evm
-bb verify -k target/vk/vk -p target/proof/proof
+nargo execute                                        # writes target/<pkg>.gz (witness)
+bb prove    -b target/<pkg>.json -w target/<pkg>.gz -o target
+bb write_vk -b target/<pkg>.json                    -o target   # REQUIRED before verify
+bb verify   -k target/vk -p target/proof
 ```
-- Verify proofs generate and verify correctly
-- Note proof size and generation time
+- Flags vary by `bb` version — check `bb --help`. Scheme selection is `-s/--scheme ultra_honk`
+  on recent versions; for an EVM/keccak target use `--oracle_hash keccak` (there is no `-t evm`
+  flag). Newer `bb verify` also takes the public-inputs file.
+- Verify proofs generate AND verify (the round-trip is the point); note proof size / gen time
 
 ---
 
@@ -78,12 +86,30 @@ Conduct systematic manual review using the security checklist. For each category
 
 ### Review Categories (in priority order):
 
-1. **Underconstraints** - Are all values properly constrained? Can invalid inputs produce valid proofs?
-2. **Field Arithmetic** - Overflow/underflow in finite field? Missing range checks?
-3. **Privacy Leaks** - Do public outputs leak private data? Correlation attacks?
-4. **Nullifier Security** - Unique? Deterministic? Bound to identity?
-5. **Signature/Hash Usage** - Domain separation? Correct parameters?
-6. **Intent vs Implementation** - Does code match specification?
+1. **Unconstrained / `unsafe` / oracles** — the #1 Noir soundness footgun. Any value
+   computed in an `unconstrained fn`, returned through an `unsafe { ... }` block, or from
+   an `#[oracle]` / foreign call is **fully prover-controlled** and must be re-constrained
+   in-circuit. Grep for `unconstrained`, `unsafe`, `#[oracle]`, `Safety:`; for each, verify
+   the returned witness is bound by asserts (classic hint-then-verify: an unconstrained
+   division hint must be checked with `assert(q * d + r == n); assert(r < d)`).
+2. **Underconstraints** - Are all values properly constrained? Can invalid inputs produce valid proofs?
+3. **Field vs. integer arithmetic** - `Field` math wraps **silently** mod p (a soundness risk
+   on attacker-controlled witnesses → require explicit range/bit-size checks before add/sub/mul).
+   Unsigned integer types (`u8`…`u128`) are auto-range-checked by the compiler, so overflow makes
+   the proof *fail* — a completeness/DoS concern, not a silent wrap. Do **not** flag `u64 + u64`
+   as "missing an overflow check."
+4. **Encoding & canonicity (aliasing)** - Bit/byte decompositions of a `Field` are non-unique
+   unless constrained below the modulus (x vs x+p); `Field as uN` casts truncate high bits
+   **without** proving the value fits (add a bit-size assertion first); packed encodings must be injective.
+5. **Privacy Leaks** - Do public outputs leak private data? Correlation attacks?
+6. **Nullifier Security** - Unique? Deterministic? Bound to identity?
+7. **Signature/Hash Usage** - Domain separation? Correct parameters?
+8. **Verifier / integration boundary** - The consuming verifier/contract must validate every
+   public input against expected values (a sound circuit is still exploitable if the verifier
+   ignores one). Bind the proof to `msg.sender`/recipient to prevent front-running. For recursion
+   (`std::verify_proof`): is the vk (or its hash) constrained/public, and are the inner public
+   inputs constrained?
+9. **Intent vs Implementation** - Does code match specification?
 
 ### For Each Potential Finding:
 
@@ -104,7 +130,7 @@ Conduct systematic manual review using the security checklist. For each category
 | High | Privacy leak, nullifier collision | Possible | Must fix before mainnet |
 | Medium | Limited privacy leak, edge cases | Requires conditions | Should fix |
 | Low | Best practice violation | Unlikely | Consider fixing |
-| Info | Code quality, gas optimization | N/A | Informational |
+| Info | Code quality, constraint-count notes | N/A | Informational |
 
 For detailed severity criteria, see [resources/severity-rubric.md](resources/severity-rubric.md).
 
@@ -130,14 +156,21 @@ For the full report template, see [resources/report-template.md](resources/repor
 ## ZK Vulnerability Categories
 
 ### Constraint Issues
+- **ZK-UW**: Unconstrained witness - value from `unconstrained`/`unsafe`/oracle never re-constrained (prover-controlled) — **the highest-priority Noir bug class**
 - **ZK-UC**: Underconstrained - Missing constraints allow invalid proofs
 - **ZK-OC**: Overconstrained - Valid inputs rejected
 - **ZK-MC**: Missing constraint - Business logic not enforced
 
-### Arithmetic Issues
-- **ZK-FO**: Field overflow - Arithmetic wraps around field modulus
-- **ZK-FU**: Field underflow - Subtraction wraps around
+### Arithmetic & Encoding Issues
+- **ZK-FO**: Field overflow - `Field` arithmetic wraps mod p (silent; integer types are compiler-range-checked instead)
+- **ZK-FU**: Field underflow - `Field` subtraction wraps
 - **ZK-RC**: Missing range check - Value not bounded
+- **ZK-AL**: Aliasing / non-canonical encoding - non-unique decomposition, or a truncating `as` cast without a prior bit-size assertion
+
+### Integration Issues
+- **ZK-VP**: Verifier public-input gap - the consumer ignores or mis-validates a public input
+- **ZK-PB**: Proof not bound to caller - front-runnable / stealable proof
+- **ZK-RV**: Recursion vk unconstrained - inner vk or public inputs not pinned
 
 ### Privacy Issues
 - **ZK-PL**: Public leak - Private data in public output
@@ -160,13 +193,15 @@ For the full report template, see [resources/report-template.md](resources/repor
 
 | Vulnerability | Check | Impact |
 |--------------|-------|--------|
+| Unconstrained/`unsafe` result | Is the returned witness re-checked with asserts? | Soundness break (prover controls it) |
 | Missing `assert()` | Can invalid input pass? | Soundness break |
-| Field overflow | `a + b` where both are large | Incorrect arithmetic |
-| Missing range check | Is `x < 256` enforced? | Type confusion |
+| Field overflow | `Field` add/mul on attacker-controlled values, no range check? | Silent wrap mod p → soundness |
+| Truncating cast | `x as u8` without `x.assert_max_bit_size::<8>()` first? | Aliasing / type confusion |
 | Public leak | Is `pub` intentional? | Privacy break |
 | Weak nullifier | Hash of small domain? | Brute-forceable |
 | No domain separation | Same hash for different uses? | Collision attacks |
 | Unbound proof | Proof works for any address? | Authorization bypass |
+| Verifier input gap | Does the consumer validate every public input? | Exploitable despite a sound circuit |
 
 ---
 

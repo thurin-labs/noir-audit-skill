@@ -80,7 +80,9 @@ Use this rubric to consistently classify findings by severity.
 **Action**: Should fix before mainnet. Acceptable to defer with documented risk.
 
 **Examples**:
-- Field overflow possible with values > 2^200
+- Field overflow only reachable via values that are already range-checked elsewhere
+  (if the overflowing value is an unconstrained/prover-chosen witness, it's High/Critical —
+  "requires values > 2^200" is **not** mitigating when the prover supplies the witness for free)
 - Privacy leak only affects users with specific attribute combination
 - Missing range check on value that's validated elsewhere
 
@@ -141,7 +143,7 @@ When evaluating severity for ZK circuits, consider:
 |-----------------|------------------|
 | Soundness | Critical (proofs can be forged) |
 | Privacy | High-Medium (depends on data sensitivity) |
-| Completeness | Medium-Low (legitimate users affected) |
+| Completeness | Context-dependent, up to High (e.g. frozen funds / permanently un-withdrawable = High; cosmetic = Low) |
 
 ### Privacy Leak Assessment
 
@@ -197,4 +199,4 @@ If severity is unclear:
 |---------|----------|-----------|
 | Nullifier can be set arbitrarily | Critical | Complete bypass |
 | Same nullifier for different events | High | Cross-event replay |
-| Nullifier collision at 2^64 scale | Low | Impractical to exploit |
+| Nullifier space of 2^64 | Medium-High | Birthday collisions arrive around ~2^32 samples — practical at scale; a 2^64 *attacker work factor* is borderline for well-resourced attackers. Specify which you mean. |
